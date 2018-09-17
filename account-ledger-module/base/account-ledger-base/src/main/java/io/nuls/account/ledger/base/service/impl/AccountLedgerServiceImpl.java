@@ -76,6 +76,7 @@ import io.nuls.protocol.model.validator.TxMaxSizeValidator;
 import io.nuls.protocol.model.validator.TxRemarkValidator;
 import io.nuls.protocol.service.BlockService;
 import io.nuls.protocol.service.TransactionService;
+import jdk.nashorn.internal.runtime.Context;
 
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
@@ -623,7 +624,7 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
             }
             tx.setCoinData(null);
             //默认coindata中to为38 +备注+签名
-            int txSize = tx.size() + 38+ TxRemarkValidator.MAX_REMARK_LEN;
+            int txSize = tx.size() + 38 + TxRemarkValidator.MAX_REMARK_LEN;
             int targetSize = TxMaxSizeValidator.MAX_TX_SIZE - txSize;
             Collections.sort(coinList, CoinComparatorDesc.getInstance());
             int size = tx.size() + 38;
@@ -657,7 +658,7 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
                 if (size > targetSize * txNum) {//大于一个tx的size 所以需要另一个tx装
                     size += txSize;
                     txNum++;
-                    sign_type=0;
+                    sign_type = 0;
                 }
             }
             Na fee = TransactionFeeCalculator.getFee(size, price);
@@ -718,10 +719,10 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
             CoinData coinData = new CoinData();
             //如果为多签地址则以脚本方式存储
             Coin toCoin = null;
-            if(to[2] == 3){
+            if (to[2] == 3) {
                 Script scriptPubkey = SignatureUtil.createOutputScript(to);
                 toCoin = new Coin(scriptPubkey.getProgram(), values);
-            }else{
+            } else {
                 toCoin = new Coin(to, values);
             }
             coinData.getTo().add(toCoin);
@@ -895,10 +896,10 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
             for (MultipleAddressTransferModel to : toList) {
                 //如果为多签地址
                 Coin toCoin = null;
-                if(to.getAddress()[2] == 3){
+                if (to.getAddress()[2] == 3) {
                     Script scriptPubkey = SignatureUtil.createOutputScript(to.getAddress());
                     toCoin = new Coin(scriptPubkey.getProgram(), Na.valueOf(to.getAmount()));
-                }else{
+                } else {
                     toCoin = new Coin(to.getAddress(), Na.valueOf(to.getAmount()));
                 }
                 coinData.getTo().add(toCoin);
@@ -906,8 +907,8 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
             if (price == null) {
                 price = TransactionFeeCalculator.MIN_PRECE_PRE_1024_BYTES;
             }
-            List<CoinDataResult> coinDataResultList = new ArrayList<>();
-            int sub = 0;
+           // List<CoinDataResult> coinDataResultList = new ArrayList<>();
+          /*  int sub = 0;
             for (MultipleAddressTransferModel from : fromList) {//获取每个from地址的 utxo(需要的币从小到大排序)
                 CoinDataResult coinDataResult = null;
                 if (sub == 0) {
@@ -916,7 +917,10 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
                     coinDataResult = getCoinData(from.getAddress(), Na.valueOf(from.getAmount()), coinData.size(), price);
                 }
                 coinDataResultList.add(coinDataResult);
-            }
+            }*/
+
+            List<CoinDataResult>  coinDataResultList= getCoinDataMultipleAdress(fromList, tx.size() + coinData.size(), price);
+
             List<Coin> fromCoinList = new ArrayList<>();//从多个地址中获取币 from
             List<Coin> changeCoinList = new ArrayList<>();
             for (CoinDataResult coinDataResult : coinDataResultList) {
@@ -979,6 +983,143 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
             Log.error(e);
             return Result.getFailed(e.getErrorCode());
         }
+    }
+
+    private List<CoinDataResult> getCoinDataMultipleAdress(List<MultipleAddressTransferModel> fromList, int size, Na price) {
+
+        List<CoinDataResult> coinDataResultList = new ArrayList<>();
+        //总手续费
+        Na fee = Na.ZERO;
+        for (int j = 0; j < fromList.size(); j++) {
+            byte[] address = fromList.get(j).getAddress();
+            Na amount = Na.valueOf(fromList.get(j).getAmount());
+            if (null == price) {
+                throw new NulsRuntimeException(KernelErrorCode.PARAMETER_ERROR);
+            }
+            lock.lock();
+            try {
+                List<Coin> coins = new ArrayList<>();
+                CoinDataResult coinDataResult = new CoinDataResult();
+                coinDataResult.setEnough(false);
+                List<Coin> coinList = balanceManager.getCoinListByAddress(address);
+                coinList = coinList.stream()
+                        .filter(coin1 -> coin1.usable() && !Na.ZERO.equals(coin1.getNa()))
+                        .sorted(CoinComparator.getInstance())
+                        .collect(Collectors.toList());
+                 //没有utxo支付
+                if (coinList.isEmpty()) {
+                    //一个地址没有utxo所有失败
+                    coinDataResultList.clear();
+                    return coinDataResultList;
+                }
+                Na values = Na.ZERO;
+                // 累加到足够支付转出额与手续费
+                for (int i = 0; i < coinList.size(); i++) {
+                    Coin coin = coinList.get(i);
+                    coins.add(coin);
+                    size += coin.size();
+                    if (i == 127) {
+                        size += 1;
+                    }
+                    //每次累加一条未花费余额时，需要重新计算手续费
+                    //Na fee = TransactionFeeCalculator.getFee(size, price);
+                    values = values.add(coin.getNa());
+                    /**
+                     * 判断是否是脚本验证UTXO
+                     * */
+                    int signType = coinDataResult.getSignType();
+                    if (signType != 3) {
+                        if ((signType & 0x01) == 0 && coin.getTempOwner().length == 23) {
+                            coinDataResult.setSignType((byte) (signType | 0x01));
+                            size += P2PHKSignature.SERIALIZE_LENGTH;
+                        } else if ((signType & 0x02) == 0 && coin.getTempOwner().length != 23) {
+                            coinDataResult.setSignType((byte) (signType | 0x02));
+                            size += P2PHKSignature.SERIALIZE_LENGTH;
+                        }
+                    }
+
+                    //需要判断是否找零，如果有找零，则需要重新计算手续费
+                    if (values.isGreaterThan(amount)) {
+                        Na change = values.subtract(amount);
+                        Coin changeCoin = new Coin();
+                        //changeCoin.setOwner(address);
+                        //changeCoin.setOwner(SignatureUtil.createOutputScript(address).getProgram());
+                        changeCoin.setOwner(address);
+                        changeCoin.setNa(change);
+                        size += changeCoin.size();
+                        // fee = TransactionFeeCalculator.getFee(size + changeCoin.size(), price);
+                        // if (values.isLessThan(amount.add(fee))) {
+                        //     continue;
+                        // }
+                        // changeCoin.setNa(values.subtract(amount));
+                        if (!changeCoin.getNa().equals(Na.ZERO)) {
+                            coinDataResult.setChange(changeCoin);
+                        }
+                    }
+                    //coinDataResult.setFee(fee);
+                    if (values.isGreaterOrEquals(amount)) {
+                        coinDataResult.setEnough(true);
+                        coinDataResult.setCoinList(coins);
+                        coinDataResultList.add(coinDataResult);
+                        break;
+                    }
+                    //最后一个地址计算手续费
+                    if (fromList.size() - 1 == j) {
+                        fee = TransactionFeeCalculator.getFee(size, price);
+                    }
+                }
+
+            } finally {
+                lock.unlock();
+            }
+        }
+        //找零
+        for (int j = 0; j < fromList.size(); j++) {
+            byte[] address = fromList.get(j).getAddress();
+            lock.lock();
+            try {
+                CoinDataResult coinDataResult = new CoinDataResult();
+                coinDataResult.setEnough(false);
+                List<Coin> coins = new ArrayList<>();
+                List<Coin> coinList = balanceManager.getCoinListByAddress(address);
+                coinList = coinList.stream()
+                        .filter(coin1 -> coin1.usable() && !Na.ZERO.equals(coin1.getNa()))
+                        .sorted(CoinComparator.getInstance())
+                        .collect(Collectors.toList());
+                //没有utxo给手续费
+                if (coinList.isEmpty()) {
+                    continue;
+                }
+                Na values = Na.ZERO;
+                // 累加到足够支付转出额与手续费
+                for (int i = 0; i < coinList.size(); i++) {
+                  Coin coin=  coinList.get(i);
+                    values = values.add(coin.getNa());
+                    coins.add(coin);
+                    if (values.isLessThan(fee)) {
+                        continue;
+                    }
+                    Na change = values.subtract(fee);
+                    Coin changeCoin = new Coin();
+                    //changeCoin.setOwner(address);
+                    //changeCoin.setOwner(SignatureUtil.createOutputScript(address).getProgram());
+                    changeCoin.setOwner(address);
+                    changeCoin.setNa(change);
+                    if (values.isGreaterOrEquals(fee) && !changeCoin.getNa().equals(Na.ZERO)) {
+                        coinDataResult.setEnough(true);
+                        coinDataResult.setChange(changeCoin);
+                        coinDataResult.setCoinList(coins);
+                        coinDataResultList.add(coinDataResult);
+                        break;
+                    }
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
+        return coinDataResultList;
+
+
     }
 
     @Override
@@ -1378,18 +1519,19 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
 
     /**
      * A transfers NULS to B   多签交易
+     *
      * @param fromAddr address of A
      * @param signAddr address of B
-     * @param values NULS amount
+     * @param values   NULS amount
      * @param password password of A
-     * @param remark remarks of transaction
-     * @param price Unit price of fee
-     * @param pubkeys 公钥列表
-     * @param m     至少需要签名验证通过
+     * @param remark   remarks of transaction
+     * @param price    Unit price of fee
+     * @param pubkeys  公钥列表
+     * @param m        至少需要签名验证通过
      * @return Result
      */
     @Override
-    public  Result transferP2sh(byte[] fromAddr, byte[] signAddr, List<MultipleAddressTransferModel> outputs, Na values, String password, String remark, Na price, List<String>pubkeys,int m,String txdata){
+    public Result transferP2sh(byte[] fromAddr, byte[] signAddr, List<MultipleAddressTransferModel> outputs, Na values, String password, String remark, Na price, List<String> pubkeys, int m, String txdata) {
         try {
             Result<Account> accountResult = accountService.getAccount(signAddr);
             if (accountResult.isFailed()) {
@@ -1407,7 +1549,7 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
             List<P2PHKSignature> p2PHKSignatures = new ArrayList<>();
             List<Script> scripts = new ArrayList<>();
             //如果txdata为空则表示当前请求为多签发起者调用，需要创建交易
-            if(txdata == null || txdata.trim().length() == 0){
+            if (txdata == null || txdata.trim().length() == 0) {
                 if (StringUtils.isNotBlank(remark)) {
                     try {
                         tx.setRemark(remark.getBytes(NulsConfig.DEFAULT_ENCODING));
@@ -1415,16 +1557,16 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
                         Log.error(e);
                     }
                 }
-                Script redeemScript = ScriptBuilder.createNulsRedeemScript(m,pubkeys);
+                Script redeemScript = ScriptBuilder.createNulsRedeemScript(m, pubkeys);
                 tx.setTime(TimeService.currentTimeMillis());
                 CoinData coinData = new CoinData();
                 for (MultipleAddressTransferModel to : outputs) {
                     //如果为多签地址
                     Coin toCoin = null;
-                    if(to.getAddress()[2] == 3){
+                    if (to.getAddress()[2] == 3) {
                         Script scriptPubkey = SignatureUtil.createOutputScript(to.getAddress());
                         toCoin = new Coin(scriptPubkey.getProgram(), Na.valueOf(to.getAmount()));
-                    }else{
+                    } else {
                         toCoin = new Coin(to.getAddress(), Na.valueOf(to.getAmount()));
                     }
                     coinData.getTo().add(toCoin);
@@ -1433,8 +1575,8 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
                     price = TransactionFeeCalculator.MIN_PRECE_PRE_1024_BYTES;
                 }
                 //交易签名的长度为m*单个签名长度+赎回脚本长度
-                int scriptSignLenth = redeemScript.getProgram().length + m*72;
-                CoinDataResult coinDataResult = getMutilCoinData(fromAddr, values, tx.size() + coinData.size()+scriptSignLenth, price);
+                int scriptSignLenth = redeemScript.getProgram().length + m * 72;
+                CoinDataResult coinDataResult = getMutilCoinData(fromAddr, values, tx.size() + coinData.size() + scriptSignLenth, price);
                 if (!coinDataResult.isEnough()) {
                     return Result.getFailed(AccountLedgerErrorCode.INSUFFICIENT_BALANCE);
                 }
@@ -1449,7 +1591,7 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
                 transactionSignature.setScripts(scripts);
             }
             //如果txdata不为空表示多签交易已经创建好了，将交易反序列化出来
-            else{
+            else {
                 byte[] txByte = Hex.decode(txdata);
                 tx.parse(new NulsByteBuffer(txByte));
                 transactionSignature.parse(new NulsByteBuffer(tx.getTransactionSignature()));
@@ -1461,20 +1603,20 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
             ECKey eckey = account.getEcKey(password);
             p2PHKSignature.setPublicKey(eckey.getPubKey());
             //用当前交易的hash和账户的私钥账户
-            p2PHKSignature.setSignData(accountService.signDigest(tx.getHash().getDigestBytes(),eckey));
+            p2PHKSignature.setSignData(accountService.signDigest(tx.getHash().getDigestBytes(), eckey));
             p2PHKSignatures.add(p2PHKSignature);
 
             //当已签名数等于M则自动广播该交易
-            if(p2PHKSignatures.size() == SignatureUtil.getM(scripts.get(0))){
+            if (p2PHKSignatures.size() == SignatureUtil.getM(scripts.get(0))) {
                 //将交易中的签名数据P2PHKSignatures按规则排序
-                Collections.sort(p2PHKSignatures,P2PHKSignature.PUBKEY_COMPARATOR);
+                Collections.sort(p2PHKSignatures, P2PHKSignature.PUBKEY_COMPARATOR);
                 //将排序后的P2PHKSignatures的签名数据取出和赎回脚本结合生成解锁脚本
-                List<byte[]> signatures= new ArrayList<>();
-                for (P2PHKSignature p2PHKSignatureTemp:p2PHKSignatures) {
+                List<byte[]> signatures = new ArrayList<>();
+                for (P2PHKSignature p2PHKSignatureTemp : p2PHKSignatures) {
                     signatures.add(p2PHKSignatureTemp.getSignData().getSignBytes());
                 }
                 transactionSignature.setP2PHKSignatures(null);
-                Script scriptSign = ScriptBuilder.createNulsP2SHMultiSigInputScript(signatures,scripts.get(0));
+                Script scriptSign = ScriptBuilder.createNulsP2SHMultiSigInputScript(signatures, scripts.get(0));
                 transactionSignature.getScripts().clear();
                 transactionSignature.getScripts().add(scriptSign);
                 tx.setTransactionSignature(transactionSignature.serialize());
@@ -1501,12 +1643,12 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
                 return Result.getSuccess().setData(tx.getHash().getDigestHex());
             }
             //如果签名数还没达到，则返回交易
-            else{
+            else {
                 transactionSignature.setP2PHKSignatures(p2PHKSignatures);
                 tx.setTransactionSignature(transactionSignature.serialize());
                 return Result.getSuccess().setData(Hex.encode(tx.serialize()));
             }
-        }catch (IOException e) {
+        } catch (IOException e) {
             Log.error(e);
             return Result.getFailed(KernelErrorCode.IO_ERROR);
         } catch (NulsException e) {
@@ -1572,7 +1714,7 @@ public class AccountLedgerServiceImpl implements AccountLedgerService, Initializ
                 }
             }
             return coinDataResult;
-        }finally {
+        } finally {
             lock.unlock();
         }
     }
